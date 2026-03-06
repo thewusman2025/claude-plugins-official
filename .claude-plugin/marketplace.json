@@ -684,6 +684,17 @@
         "url": "https://github.com/semgrep/mcp-marketplace.git"
       },
       "homepage": "https://github.com/semgrep/mcp-marketplace.git"
+    },
+    {
+      "name": "chrome-devtools-mcp",
+      "description": "Control and inspect a live Chrome browser from your coding agent. Record performance traces, analyze network requests, check console messages with source-mapped stack traces, and automate browser actions with Puppeteer.",
+      "category": "development",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/ChromeDevTools/chrome-devtools-mcp.git",
+        "sha": "c2d8009ff75f76bce1ec4cf79c2467b50d81725e"
+      },
+      "homepage": "https://github.com/ChromeDevTools/chrome-devtools-mcp"
     }
   ]
 }
