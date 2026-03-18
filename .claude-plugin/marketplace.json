@@ -1282,6 +1282,16 @@
         "sha": "b9cfcb860cb5ae4ece57d67422a6cdd92ef96739"
       },
       "homepage": "https://github.com/TSedmanDC/Voila-API-Skill"
+    },
+    {
+      "name": "remember",
+      "description": "Continuous memory for Claude Code. Extracts, summarizes, and compresses conversations into tiered daily logs. Claude remembers what you did yesterday.",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/Digital-Process-Tools/claude-remember.git",
+        "sha": "779ab61d8d412230eeec1840b8ca104bebea4358"
+      },
+      "homepage": "https://github.com/Digital-Process-Tools/claude-remember"
     }
   ]
 }
