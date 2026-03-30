@@ -702,7 +702,7 @@
         "email": "support@anthropic.com"
       },
       "source": "./plugins/math-olympiad",
-      "category": "productivity",
+      "category": "math",
       "homepage": "https://github.com/anthropics/claude-plugins-official/tree/main/plugins/math-olympiad"
     },
     {
