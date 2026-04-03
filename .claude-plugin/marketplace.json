@@ -136,6 +136,18 @@
       "homepage": "https://github.com/anthropics/claude-plugins-public/tree/main/external_plugins/autofix-bot"
     },
     {
+      "name": "aws-amplify",
+      "description": "Build full-stack apps with AWS Amplify Gen 2 using guided workflows for authentication, data models, storage, GraphQL APIs, and Lambda functions.",
+      "category": "development",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/awslabs/agent-plugins.git",
+        "path": "plugins/aws-amplify",
+        "ref": "main"
+      },
+      "homepage": "https://github.com/awslabs/agent-plugins"
+    },
+    {
       "name": "aws-serverless",
       "description": "Design, build, deploy, test, and debug serverless applications with AWS Serverless services.",
       "category": "development",
@@ -344,6 +356,18 @@
         "sha": "85d6053b1e21724f9cefb1e3f5219bd54fc77224"
       },
       "homepage": "https://github.com/astronomer/agents"
+    },
+    {
+      "name": "databases-on-aws",
+      "description": "Expert database guidance for the AWS database portfolio. Design schemas, execute queries, handle migrations, and choose the right database for your workload.",
+      "category": "database",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/awslabs/agent-plugins.git",
+        "path": "plugins/databases-on-aws",
+        "ref": "main"
+      },
+      "homepage": "https://github.com/awslabs/agent-plugins"
     },
     {
       "name": "deploy-on-aws",
@@ -727,18 +751,6 @@
       "homepage": "https://github.com/microsoftdocs/mcp"
     },
     {
-      "name": "migration-to-aws",
-      "description": "Assess current cloud provider usage and billing to estimate and compare AWS services and pricing, with recommendations for migration or continued use of current provider.",
-      "category": "migration",
-      "source": {
-        "source": "git-subdir",
-        "url": "https://github.com/awslabs/agent-plugins.git",
-        "path": "plugins/migration-to-aws",
-        "ref": "main"
-      },
-      "homepage": "https://github.com/awslabs/agent-plugins"
-    },
-    {
       "name": "mintlify",
       "description": "Build beautiful documentation sites with Mintlify. Convert non-markdown files into properly formatted MDX pages, add and modify content with correct component use, and automate documentation updates.",
       "category": "development",
@@ -1112,6 +1124,18 @@
           }
         }
       }
+    },
+    {
+      "name": "sagemaker-ai",
+      "description": "Build, train, and deploy AI models with deep AWS AI/ML expertise brought directly into your coding assistants, covering the surface area of Amazon SageMaker AI.",
+      "category": "development",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/awslabs/agent-plugins.git",
+        "path": "plugins/sagemaker-ai",
+        "ref": "main"
+      },
+      "homepage": "https://github.com/awslabs/agent-plugins"
     },
     {
       "name": "sanity-plugin",
