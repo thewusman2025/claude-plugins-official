@@ -1094,6 +1094,20 @@
       }
     },
     {
+      "name": "runway-api",
+      "description": "Helps integrate Runway's API into projects. Guides API key setup, analyzes codebase compatibility, and provides hands-on integration assistance for video generation, image generation, audio, and file uploads.",
+      "category": "development",
+      "author": {
+        "name": "Runway"
+      },
+      "source": {
+        "source": "url",
+        "url": "https://github.com/runwayml/skills.git",
+        "sha": "cc609882edf0b65c94deccd42c841ed934d2d8d0"
+      },
+      "homepage": "https://docs.dev.runwayml.com/"
+    },
+    {
       "name": "rust-analyzer-lsp",
       "description": "Rust language server for code intelligence and analysis",
       "version": "1.0.0",
