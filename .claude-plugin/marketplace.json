@@ -1244,6 +1244,17 @@
       "homepage": "https://sourcegraph.com"
     },
     {
+      "name": "spotify-ads-api",
+      "description": "Manage Spotify ad campaigns with natural language. Create campaigns, ad sets, ads, pull reports, and handle OAuth — all through conversation.",
+      "category": "productivity",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/spotify/ads-claude-plugin.git",
+        "sha": "a4bce9912db071d47dfb410086a48004e0539efa"
+      },
+      "homepage": "https://github.com/spotify/ads-claude-plugin"
+    },
+    {
       "name": "stagehand",
       "description": "Browser automation skill for Claude Code using Stagehand. Automate web interactions, extract data, and navigate websites using natural language.",
       "version": "0.1.0",
