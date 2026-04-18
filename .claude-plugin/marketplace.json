@@ -8,8 +8,8 @@
   },
   "plugins": [
     {
-      "name": "telegram",
-      "description": "Telegram messaging bridge with built-in access control. Patched: atomic O_CREAT|O_EXCL poll lock + follower mode, replacing upstream's SIGTERM-kill dedup that breaks the first session's MCP pipe.",
+      "name": "telegram-wus",
+      "description": "Telegram messaging bridge with built-in access control. Patched: atomic O_CREAT|O_EXCL poll lock + follower mode, replacing upstream's SIGTERM-kill dedup that breaks the first session's MCP pipe. Renamed to telegram-wus to eliminate name collision with upstream telegram@claude-plugins-official.",
       "category": "productivity",
       "source": "./external_plugins/telegram"
     }
