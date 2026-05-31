@@ -19,9 +19,11 @@ import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, openSync, closeSync } from 'fs'
-import { homedir } from 'os'
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, openSync, closeSync, existsSync } from 'fs'
+import { homedir, tmpdir } from 'os'
 import { join, extname, sep } from 'path'
+import { execSync } from 'child_process'
+import { dlopen, FFIType } from 'bun:ffi'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -48,59 +50,228 @@ if (!TOKEN) {
     `  set in ${ENV_FILE}\n` +
     `  format: TELEGRAM_BOT_TOKEN=123456789:AAH...\n`,
   )
+  // Token-missing happens BEFORE forensics helpers are defined — use plain exit.
   process.exit(1)
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
-const LOCK_FILE = join(STATE_DIR, 'poll.lock')
+const PID_FILE = join(STATE_DIR, 'bot.pid')
+const EXIT_LOG_FILE = join(STATE_DIR, 'exits.log')
 
-// Telegram allows exactly one getUpdates consumer per token. Use an atomic
-// exclusive-create lock to decide who polls. If the lock file already exists
-// and the holder is alive, this instance yields (runs in follower mode with
-// outbound tools only) instead of killing the holder — preserving the active
-// MCP pipe. True orphans (dead PID) are reclaimed by removing the stale lock.
+// Telegram allows exactly one getUpdates consumer per token. We do NOT
+// dedup at startup — two prior attempts both regressed:
+//   1. Blanket "kill any other server.ts at startup" (pre-2026-04-19) —
+//      broke subagent pollers (Agent tool, Explore, /loop) parented to a
+//      live `claude --channels` session. Removed 2026-04-19.
+//   2. PID-aware dedup (2026-04-29 20:42) — walked parent chain and
+//      killed only "orphans" (no live --channels ancestor). Race
+//      condition during MCP reconnect churn classified freshly-spawned
+//      pollers as orphans and killed legitimate ones. Rolled back
+//      2026-04-30.
+//
+// Current strategy: no startup dedup. Orphan pollers may accumulate; the
+// /telegram-health command + bugs/telegram-orphan-poller.md document the
+// manual cleanup. Webhook mode is the architecturally correct end-state.
+
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 
-let isPollingLeader = false
+// PID_FILE is written AFTER we win the flock — see line ~178. Multiple buns
+// can co-exist now (standby semantics); only the lock-holder owns bot.pid.
 
-function acquirePollLock(): boolean {
+// ────────────────────────────────────────────────────────────────────────
+// v3 process-singleton (2026-05-23) — OS file lock via Bun FFI → libc flock(2).
+// Replaces v1 (parent-death watchdog) + v2 (Cursor ancestor rejection), both
+// reverted 2026-05-11. v3 is correctness-by-kernel, not heuristic.
+//
+// Behavior:
+//   1. Try to acquire exclusive non-blocking flock on a heartbeat file
+//   2. If contested AND we are a legitimate spawn (--channels in our ancestry)
+//      AND the current holder is NOT, send SIGTERM and reacquire (Tier 1
+//      takeover — preserves the principle "terminal --channels session wins")
+//   3. If we cannot acquire, exit cleanly with code 0 (NOT 1 — parent must
+//      not interpret a polite refusal as a crash)
+//   4. Once acquired, write a heartbeat JSON to the lock file every 30s with
+//      our pid, start time, last poll time, and parent chain — read by
+//      /telegram-health for a 2-second lock + liveness check
+//   5. Wedge watchdog: if no Telegram API call has succeeded in 90s, self-exit
+//      with code 1 to release the lock for the next spawn
+//
+// Codex 5.5 verified design, 2026-05-23. fs-ext NPM is incompatible with Bun
+// (native node-gyp module) so we call libc flock directly via Bun FFI.
+//
+// Lock lives in STATE_DIR (owner-only 0o700), NOT in /tmp or os.tmpdir() —
+// keeps the heartbeat payload trustworthy. Tier 1 takeover ALSO verifies
+// the target PID is a live `bun server.ts` process before SIGTERMing.
+const POLLER_LOCK_PATH = join(STATE_DIR, 'poller.lock')
+const POLLER_LOCK_FD = openSync(POLLER_LOCK_PATH, 'w+', 0o600)
+const _libc_flock = dlopen('libc.dylib', {
+  flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+}).symbols.flock
+const LOCK_EX = 2, LOCK_NB = 4
+function tryFlock(): boolean { return _libc_flock(POLLER_LOCK_FD, LOCK_EX | LOCK_NB) === 0 }
+
+interface Heartbeat { pid: number; started_at: string; last_poll_ok: string; parent_chain: string[]; delivery_capable: boolean }
+
+function readParentChain(): string[] {
+  const chain: string[] = []
+  let pid: number | null = process.pid
+  for (let i = 0; i < 6 && pid; i++) {
+    try {
+      const cmd = execSync(`ps -p ${pid} -o command=`, { encoding: 'utf8' }).trim()
+      chain.push(cmd.slice(0, 100))
+      const ppid = execSync(`ps -p ${pid} -o ppid=`, { encoding: 'utf8' }).trim()
+      pid = parseInt(ppid, 10) || null
+    } catch { break }
+  }
+  return chain
+}
+
+const POLLER_PARENT_CHAIN = readParentChain()
+const POLLER_IS_LEGIT = POLLER_PARENT_CHAIN.some(c => c.includes('--channels'))
+
+// ────────────────────────────────────────────────────────────────────────
+// v4 forensics (2026-05-24) — every exit/shutdown/error path writes a JSON
+// event to ~/.claude/channels/telegram/exits.log. When bun dies again, we
+// know exactly why instead of staring at an orphaned lockfile.
+function appendExitEvent(reason: string, detail?: string, code?: number): void {
+  const event = {
+    ts: new Date().toISOString(),
+    pid: process.pid,
+    ppid: process.ppid,
+    code: code ?? null,
+    reason,
+    detail: detail ?? '',
+    parent_chain: POLLER_PARENT_CHAIN,
+  }
+  try { appendFileSync(EXIT_LOG_FILE, JSON.stringify(event) + '\n', 'utf8') } catch {}
+}
+
+function exitWithReason(code: number, reason: string, detail?: string): never {
+  appendExitEvent(reason, detail, code)
+  process.exit(code)
+}
+// ────────────────────────────────────────────────────────────────────────
+
+function readHeartbeat(): Heartbeat | null {
+  try { return JSON.parse(readFileSync(POLLER_LOCK_PATH, 'utf8')) } catch { return null }
+}
+
+const POLLER_STARTED_AT = new Date().toISOString()
+let lastPollOkMs = Date.now()
+let consecutiveDeliveryFailures = 0
+function writeHeartbeat(): void {
+  const hb: Heartbeat = {
+    pid: process.pid,
+    started_at: POLLER_STARTED_AT,
+    last_poll_ok: new Date(lastPollOkMs).toISOString(),
+    parent_chain: POLLER_PARENT_CHAIN,
+    delivery_capable: POLLER_IS_LEGIT,
+  }
+  try { writeFileSync(POLLER_LOCK_PATH, JSON.stringify(hb, null, 2)) } catch {}
+}
+
+function pidIsThisPlugin(pid: number): boolean {
+  // Defense against malicious heartbeat: verify the target PID is actually a
+  // bun process running this plugin's server.ts before SIGTERMing. ps output
+  // must contain BOTH 'bun' and 'server.ts' tokens; otherwise refuse the kill.
   try {
-    const fd = openSync(LOCK_FILE, 'wx') // O_CREAT | O_EXCL — atomic
-    writeFileSync(fd, String(process.pid))
-    closeSync(fd)
-    return true
-  } catch {
-    try {
-      const holder = parseInt(readFileSync(LOCK_FILE, 'utf8'), 10)
-      if (holder > 1 && holder !== process.pid) {
-        process.kill(holder, 0) // throws if dead
-        process.stderr.write(
-          `telegram channel: active poller pid=${holder}, entering follower mode (outbound tools only)\n`,
-        )
-        return false
-      }
-    } catch {}
-    try { rmSync(LOCK_FILE) } catch {}
-    try {
-      const fd = openSync(LOCK_FILE, 'wx')
-      writeFileSync(fd, String(process.pid))
-      closeSync(fd)
-      return true
-    } catch {
-      return false
+    const cmd = execSync(`ps -p ${pid} -o command=`, { encoding: 'utf8' }).trim()
+    return cmd.includes('bun') && cmd.includes('server.ts')
+  } catch { return false }
+}
+
+// LEGIT GATE (2026-05-31): only a poller whose ancestry includes `claude --channels`
+// may ever hold the flock. && short-circuits, so a non-legit poller never even calls
+// tryFlock — it can never acquire the lock, never poll, never eat inbound. A warm spare
+// that cannot deliver is worse than no spare (see .scratch/2026-05-31-…-legit-gate.md).
+let pollerLockAcquired = POLLER_IS_LEGIT && tryFlock()
+if (!pollerLockAcquired) {
+  const hb = readHeartbeat()
+  const holderIsRogue = hb && !hb.parent_chain.some(c => c.includes('--channels'))
+  if (POLLER_IS_LEGIT && holderIsRogue && hb && pidIsThisPlugin(hb.pid)) {
+    process.stderr.write(`telegram channel: lock held by rogue PID ${hb.pid} (Cursor autospawn); legit takeover\n`)
+    try { process.kill(hb.pid, 'SIGTERM') } catch {}
+    const settleStart = Date.now()
+    while (Date.now() - settleStart < 2000) {
+      if (tryFlock()) { pollerLockAcquired = true; break }
     }
+  } else if (POLLER_IS_LEGIT && holderIsRogue && hb && !pidIsThisPlugin(hb.pid)) {
+    process.stderr.write(`telegram channel: lock holder PID ${hb.pid} is not a bun/server.ts process — refusing takeover\n`)
   }
 }
 
-isPollingLeader = acquirePollLock()
+// v4 (2026-05-24): no more exit-on-contention. The MCP handshake (line ~776)
+// proceeds regardless; standby buns keep retrying flock acquisition in the
+// background. When the lock-holder dies (kernel auto-releases flock), the
+// next-in-line takes over without needing claude --channels to respawn us.
+if (pollerLockAcquired) {
+  lastPollOkMs = Date.now()
+  writeFileSync(PID_FILE, String(process.pid))
+  writeHeartbeat()
+  process.stderr.write(`telegram channel: acquired poller lock at startup (PID ${process.pid}, legit=${POLLER_IS_LEGIT})\n`)
+  appendExitEvent('poller_lock_acquired_startup')
+} else {
+  process.stderr.write(`telegram channel: another poller holds ${POLLER_LOCK_PATH} — entering standby (background flock retry)\n`)
+  appendExitEvent('poller_lock_contended_standby', POLLER_LOCK_PATH)
+}
+
+// Background flock retry — picks up the lock if the current holder dies.
+setInterval(() => {
+  if (!POLLER_IS_LEGIT) return // LEGIT GATE: non-legit pollers never take over the lock
+  if (pollerLockAcquired) return
+  if (!tryFlock()) return
+  pollerLockAcquired = true
+  lastPollOkMs = Date.now()
+  try { writeFileSync(PID_FILE, String(process.pid)) } catch {}
+  writeHeartbeat()
+  process.stderr.write(`telegram channel: acquired poller lock after standby (PID ${process.pid})\n`)
+  appendExitEvent('poller_lock_acquired_after_standby')
+}, 5_000).unref()
+
+// Wedge watchdog + heartbeat refresh. v4: no more exit on wedge. Request an
+// in-process polling restart instead (see requestPollingRestart below).
+setInterval(() => {
+  if (!pollerLockAcquired) return
+  if (Date.now() - lastPollOkMs > 90_000) {
+    const staleMs = Date.now() - lastPollOkMs
+    process.stderr.write(`telegram channel: no poll progress in ${Math.round(staleMs/1000)}s — requesting in-process polling restart\n`)
+    appendExitEvent('poll_wedge_restart', `stale_ms=${staleMs}`)
+    lastPollOkMs = Date.now()
+    requestPollingRestart('wedge-watchdog')
+  }
+  writeHeartbeat()
+}, 30_000).unref()
+// ────────────────────────────────────────────────────────────────────────
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
 process.on('unhandledRejection', err => {
+  appendExitEvent('unhandled_rejection', String(err))
   process.stderr.write(`telegram channel: unhandled rejection: ${err}\n`)
 })
 process.on('uncaughtException', err => {
+  appendExitEvent('uncaught_exception', String(err))
   process.stderr.write(`telegram channel: uncaught exception: ${err}\n`)
 })
+process.on('exit', code => {
+  appendExitEvent('process_exit', undefined, code)
+})
+
+// Self-defense patches REMOVED 2026-05-11 23:18.
+// Both attempted layers caused more harm than good:
+//   - v1 parent-death watchdog (5s ppid check): false-fired after ~18s because
+//     bun's `bun run start` wrapper exits cleanly after spawning server.ts, so
+//     process.ppid changes from `bun run` to `claude` and the watchdog
+//     interpreted that as "parent died" — killed legitimate pollers.
+//   - v2 Cursor IDE autospawn rejection (startup ancestor walk for "Cursor
+//     Helper (Plugin)"): false-fired on legitimate buns whose ancestor chain
+//     traversed through any Cursor Helper (Plugin) extension-host
+//     (including ones running non-claude-code extensions), killing buns
+//     launched from Cursor's integrated terminal.
+// Current strategy: no in-process self-defense. Orphans accumulate when
+// Cursor IDE autoloads the plugin or when sleep/wake/script hooks abandon
+// pollers. Manual cleanup via /telegram-health when /telegram-health flags
+// them. Future direction: webhook mode (eliminates the long-poll lock
+// entirely) — see upstream issue #1805.
 
 // Permission-reply spec from anthropics/claude-cli-internal
 // src/services/mcp/channelPermissions.ts — inlined (no CC repo dep).
@@ -110,6 +281,16 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 const bot = new Bot(TOKEN)
 let botUsername = ''
+
+// v3 heartbeat: every successful Telegram API call bumps the liveness clock.
+// getUpdates returns at least every ~50s (long-poll timeout), so a process
+// alive AND polling will refresh this regularly. Used by the wedge watchdog
+// above to detect alive-but-stuck pollers.
+bot.api.config.use(async (prev, method, payload, signal) => {
+  const out = await prev(method, payload, signal)
+  lastPollOkMs = Date.now()
+  return out
+})
 
 type PendingEntry = {
   senderId: string
@@ -658,23 +839,37 @@ await mcp.connect(new StdioServerTransport())
 // the bot keeps polling forever as a zombie, holding the token and blocking
 // the next session with 409 Conflict.
 let shuttingDown = false
-function shutdown(): void {
+function shutdown(reason = 'unknown'): void {
   if (shuttingDown) return
   shuttingDown = true
-  process.stderr.write('telegram channel: shutting down\n')
+  appendExitEvent('shutdown_requested', reason)
+  process.stderr.write(`telegram channel: shutting down (${reason})\n`)
   try {
-    if (parseInt(readFileSync(LOCK_FILE, 'utf8'), 10) === process.pid) rmSync(LOCK_FILE)
+    if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
   } catch {}
+  try { closeSync(POLLER_LOCK_FD) } catch {}
   // bot.stop() signals the poll loop to end; the current getUpdates request
   // may take up to its long-poll timeout to return. Force-exit after 2s.
-  setTimeout(() => process.exit(0), 2000)
-  void Promise.resolve(bot.stop()).finally(() => process.exit(0))
+  setTimeout(() => exitWithReason(0, 'shutdown_timeout', reason), 2000)
+  void Promise.resolve(bot.stop()).finally(() => exitWithReason(0, 'shutdown_complete', reason))
 }
-process.stdin.on('end', shutdown)
-process.stdin.on('close', shutdown)
-process.on('SIGTERM', shutdown)
-process.on('SIGINT', shutdown)
-process.on('SIGHUP', shutdown)
+process.stdin.on('end', () => shutdown('stdin_end'))
+process.stdin.on('close', () => shutdown('stdin_close'))
+process.on('SIGTERM', () => shutdown('sigterm'))
+process.on('SIGINT', () => shutdown('sigint'))
+process.on('SIGHUP', () => shutdown('sighup'))
+
+// v4 (2026-05-24): in-process polling restart. The wedge watchdog calls this
+// instead of exit(1) so we don't depend on claude --channels to respawn us.
+// grammY's Bot is re-usable after stop() — same instance, new bot.start().
+let restartPollingRequested = false
+function requestPollingRestart(reason: string): void {
+  if (shuttingDown || restartPollingRequested) return
+  restartPollingRequested = true
+  process.stderr.write(`telegram channel: polling restart requested (${reason})\n`)
+  appendExitEvent('polling_restart_requested', reason)
+  void Promise.resolve(bot.stop()).catch(() => {})
+}
 
 // Orphan watchdog: stdin events above don't reliably fire when the parent
 // chain (`bun run` wrapper → shell → us) is severed by a crash. Poll for
@@ -685,7 +880,7 @@ setInterval(() => {
     (process.platform !== 'win32' && process.ppid !== bootPpid) ||
     process.stdin.destroyed ||
     process.stdin.readableEnded
-  if (orphaned) shutdown()
+  if (orphaned) shutdown('orphan_watchdog')
 }, 5000).unref()
 
 // Commands are DM-only. Responding in groups would: (1) leak pairing codes via
@@ -999,8 +1194,21 @@ async function handleInbound(
         } : {}),
       },
     },
+  }).then(() => {
+    consecutiveDeliveryFailures = 0
   }).catch(err => {
-    process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
+    consecutiveDeliveryFailures++
+    process.stderr.write(`telegram channel: failed to deliver inbound to Claude (failure #${consecutiveDeliveryFailures}): ${err}\n`)
+    if (consecutiveDeliveryFailures === 1 || consecutiveDeliveryFailures % 5 === 0) {
+      appendExitEvent('mcp_delivery_failure', `count=${consecutiveDeliveryFailures} err=${String(err).slice(0,200)}`)
+    }
+    // After 10 consecutive failures, the MCP stdio peer is effectively gone —
+    // claude --channels is alive but its MCP layer is broken. We CAN'T fix
+    // that from inside; flag it via heartbeat degradation so /telegram-health
+    // and the watchdog surface the failure to the user.
+    if (consecutiveDeliveryFailures >= 10) {
+      lastPollOkMs = 0 // forces watchdog into wedged/stale state → user alert
+    }
   })
 }
 
@@ -1010,18 +1218,6 @@ bot.catch(err => {
   process.stderr.write(`telegram channel: handler error (polling continues): ${err.error}\n`)
 })
 
-// Follower mode: skip polling, keep MCP tools active for outbound calls
-// (reply, edit_message, react, download_attachment all use bot.api.* which
-// does not require a polling loop). The leader handles inbound delivery.
-if (!isPollingLeader) {
-  process.stderr.write('telegram channel: follower mode — outbound tools active, no polling\n')
-  void bot.api.getMe().then(info => {
-    botUsername = info.username
-    process.stderr.write(`telegram channel: follower connected as @${info.username}\n`)
-  }).catch(err => {
-    process.stderr.write(`telegram channel: follower getMe failed: ${err}\n`)
-  })
-} else {
 // Retry polling with backoff on any error. Previously only 409 was retried —
 // a single ETIMEDOUT/ECONNRESET/DNS failure rejected bot.start(), the catch
 // returned, and polling stopped permanently while the process stayed alive
@@ -1029,6 +1225,15 @@ if (!isPollingLeader) {
 // deaf to inbound messages until a full restart.
 void (async () => {
   for (let attempt = 1; ; attempt++) {
+    if (shuttingDown) return
+    // v4 standby gate: only poll when we own the flock. Otherwise idle 2s
+    // and re-check; the background flock-retry interval will set
+    // pollerLockAcquired=true when the lock-holder dies.
+    if (!pollerLockAcquired) {
+      await new Promise(r => setTimeout(r, 2000))
+      attempt = 0
+      continue
+    }
     try {
       await bot.start({
         onStart: info => {
@@ -1045,18 +1250,35 @@ void (async () => {
           ).catch(() => {})
         },
       })
-      return // bot.stop() was called — clean exit from the loop
+      if (shuttingDown) return
+      if (restartPollingRequested) {
+        restartPollingRequested = false
+        attempt = 0
+        process.stderr.write(`telegram channel: polling restarted (loop continues)\n`)
+        appendExitEvent('polling_restarted')
+        continue
+      }
+      return // bot.stop() called without restart request — explicit shutdown path
     } catch (err) {
       if (shuttingDown) return
-      // bot.stop() mid-setup rejects with grammy's "Aborted delay" — expected, not an error.
-      if (err instanceof Error && err.message === 'Aborted delay') return
+      // bot.stop() mid-setup rejects with grammy's "Aborted delay".
+      if (err instanceof Error && err.message === 'Aborted delay') {
+        if (restartPollingRequested) {
+          restartPollingRequested = false
+          attempt = 0
+          continue
+        }
+        return
+      }
       const is409 = err instanceof GrammyError && err.error_code === 409
-      if (is409 && attempt >= 8) {
+      if (is409 && attempt === 8) {
+        // v4: do NOT exit. With stdio no-auto-respawn, exit = permanent deafness.
+        // Log loudly, keep retrying with capped backoff.
         process.stderr.write(
           `telegram channel: 409 Conflict persists after ${attempt} attempts — ` +
-          `another poller is holding the bot token (stray 'bun server.ts' process or a second session). Exiting.\n`,
+          `another poller holds the bot token. Continuing retries indefinitely.\n`,
         )
-        return
+        appendExitEvent('polling_409_persistent', `attempt=${attempt}`)
       }
       const delay = Math.min(1000 * attempt, 15000)
       const detail = is409
@@ -1067,4 +1289,3 @@ void (async () => {
     }
   }
 })()
-}
